@@ -136,6 +136,11 @@ def check_introspection(url, headers, use_post=False):
         else:
             response = requests.get(url, params=payload, headers=headers, timeout=10)
             #Check if it is HTML
+            # The POST fallback is keyed on HTML alone. The common
+            # arrangement, GET refused with a JSON 405 or 400 while
+            # POST introspection is wide open, returns a JSON error for
+            # the GET, skips this fallback, and is reported below as a
+            # failed check instead of trying the method that works.
             if is_html(response):
                 #Attempt POST Request as a fallback
                 logging.info("Received HTML response to the GET request, attempting a POST request.")
@@ -148,6 +153,9 @@ def check_introspection(url, headers, use_post=False):
         content_type = response.headers.get('Content-Type', '').lower()
 
         if 'application/json' not in content_type:
+            # Servers answering with the newer
+            # application/graphql-response+json type fail this test as
+            # well, though their body is the JSON the next lines want.
             logging.error(f"Check failed: unexpected content type: {content_type}. Expected application/json.")
             return None
 
