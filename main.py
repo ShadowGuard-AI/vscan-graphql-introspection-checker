@@ -1,9 +1,7 @@
 import argparse
 import requests
-import json
 import logging
 import sys
-from bs4 import BeautifulSoup
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,8 +102,8 @@ def setup_argparse():
     parser.add_argument("url", help="The URL of the GraphQL endpoint to check.")
     parser.add_argument("-H", "--header", action='append', default=[],
                         help="Add custom headers to the request.  Example: -H 'Authorization: Bearer <token>'")
-    parser.add_argument("-p", "--post", action="store_true", help="Force POST request")
-    return parser.parse_args()
+    parser.add_argument("-p", "--post", action="store_true", help="Force POST request (default without this flag: try a GET request first)")
+    return parser
 
 
 def is_html(response):
@@ -125,7 +123,10 @@ def check_introspection(url, headers, use_post=False):
         use_post (bool): A boolean to force the use of POST requests.
 
     Returns:
-        bool: True if introspection is enabled, False otherwise.
+        bool or None: True if introspection is enabled, False only for a
+        well formed JSON response showing introspection disabled, and
+        None when the check failed (connection failure, HTTP error, or
+        a non JSON response), which is not a verdict about the target.
     """
     try:
         payload = {'query': INTROSPECTION_QUERY}
@@ -133,39 +134,44 @@ def check_introspection(url, headers, use_post=False):
         if use_post:
             response = requests.post(url, json=payload, headers=headers, timeout=10)
         else:
-            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            response = requests.get(url, params=payload, headers=headers, timeout=10)
             #Check if it is HTML
             if is_html(response):
-                #Attempt GET Request
-                logging.info("Received HTML response, attempting GET request with parameters.")
-                response = requests.get(url, params=payload, headers=headers, timeout=10)
+                #Attempt POST Request as a fallback
+                logging.info("Received HTML response to the GET request, attempting a POST request.")
+                response = requests.post(url, json=payload, headers=headers, timeout=10)
 
-
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        if response.status_code >= 400:
+            logging.error(f"Check failed: HTTP status {response.status_code}.")
+            return None
 
         content_type = response.headers.get('Content-Type', '').lower()
 
-        if 'application/json' in content_type:
+        if 'application/json' not in content_type:
+            logging.error(f"Check failed: unexpected content type: {content_type}. Expected application/json.")
+            return None
+
+        try:
             data = response.json()
-            if 'data' in data and '__schema' in data['data']:
-                logging.info("GraphQL introspection is enabled.")
-                return True
-            else:
-                logging.info("GraphQL introspection is not enabled or schema is restricted.")
-                return False
-        else:
-            logging.warning(f"Unexpected content type: {content_type}.  Expected application/json. Please ensure target endpoint is a graphql endpoint")
+        except ValueError:
+            logging.error("Check failed: response was not valid JSON.")
+            return None
+
+        if isinstance(data, dict) and 'data' in data and isinstance(data['data'], dict) and '__schema' in data['data']:
+            logging.info("GraphQL introspection is enabled.")
+            return True
+        if isinstance(data, dict):
+            logging.info("GraphQL introspection is not enabled or schema is restricted.")
             return False
+        logging.error("Check failed: JSON response was not an object.")
+        return None
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Request failed: {e}")
-        return False
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to decode JSON response: {e}.  Raw Response: {response.text}")
-        return False
+        return None
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-        return False
+        return None
 
 
 def parse_headers(header_list):
@@ -196,14 +202,18 @@ def main():
         logging.error("URL is required.")
         sys.exit(1)
 
-    # Security best practices: Sanitize URL (basic example, consider more robust methods)
+    # Security best practices: Sanitize URL (basic example, consider stronger methods)
     if not url.startswith(('http://', 'https://')):
         logging.warning("URL does not start with http:// or https://.  Assuming https://")
         url = 'https://' + url
 
     logging.info(f"Checking GraphQL introspection at: {url}")
 
-    if check_introspection(url, headers, use_post):
+    result = check_introspection(url, headers, use_post)
+    if result is None:
+        print("GraphQL introspection check FAILED: the endpoint could not be assessed.")
+        sys.exit(1)
+    if result:
         print("GraphQL introspection is ENABLED.")
     else:
         print("GraphQL introspection is DISABLED or restricted.")
